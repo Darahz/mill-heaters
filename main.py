@@ -147,4 +147,5 @@ while True:
     
     print(f"Total cost pr day: {(total_pr_heater * 24):.2f} NOK\033[K")
     print(f"Total cost pr month: {((total_pr_heater * 24) * days_in_month):.2f} NOK\033[K")
+    print("\033[H", end="")
     time.sleep(LOG_INTERVAL)
