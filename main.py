@@ -6,7 +6,7 @@ import requests, time, json, datetime, calendar
 import os
 
 # Update the following variables with the IP addresses of your heaters
-heatersips        = ["192.168.50.162","192.168.50.197"]
+heatersips        = [""]
 previousTemps     = [0,0]
 cumulative_energy = [0.0, 0.0]
 
@@ -147,5 +147,4 @@ while True:
     
     print(f"Total cost pr day: {(total_pr_heater * 24):.2f} NOK\033[K")
     print(f"Total cost pr month: {((total_pr_heater * 24) * days_in_month):.2f} NOK\033[K")
-    print("\033[H", end="")
     time.sleep(LOG_INTERVAL)
