@@ -1,7 +1,8 @@
 # Description: A simple script to monitor the status of heaters and log the data to a CSV file.
-# Using the mill generation 3 api
+# Using the mill generation 3 api and hva koster strømmen api.
 # https://github.com/Mill-International-AS/Generation_3_REST_API/
-
+# https://www.hvakosterstrommen.no/strompris-api/
+# https://api.met.no/weatherapi/locationforecast/2.0/mini.json?lat=?&lon=?
 import requests, time, json, datetime, calendar
 import os
 
@@ -10,30 +11,20 @@ heatersips        = [""]
 previousTemps     = [0,0]
 cumulative_energy = [0.0, 0.0]
 
-LOW_TEMP_THRESHOLD  = 15
-HIGH_TEMP_THRESHOLD = 25
-MAX_RETRIES         = 3
-RETRY_DELAY         = 5
-LOG_INTERVAL        = 60
-
-if os.path.exists("previous_state.json"):
-    with open("previous_state.json", "r") as f:
-        state = json.load(f)
-        previousTemps = state.get("previousTemps", previousTemps)
-        cumulative_energy = state.get("cumulative_energy", cumulative_energy)
-else:
-    print("No previous state file found. Starting fresh.\033[K")
-
-with open("heaters_log.csv", "a") as log_file:
-    if log_file.tell() == 0:
-        log_file.write("timestamp,heater_ip,heater_name,ambient_temp,temp_diff,alert,cumulative_kWh\n")
-
-import requests
-import datetime
+SLEEP_TIME = 60
 
 LAST_HOUR  = 0
 LAST_PRICE = 0
 
+LAST_TEMP = 0
+
+# Update the following variables with the latitude and longitude of your location
+WEATHER_LAT = 0
+WEATHER_LON = 0
+
+heater_data = {}
+
+# Function to get the current electricity price from the hvakosterstrommen API
 def get_current_price(region="NO1"):
     now = datetime.datetime.now()
     global LAST_HOUR
@@ -56,96 +47,145 @@ def get_current_price(region="NO1"):
 
     return None
 
+def get_operation_mode(heater):
+    print(f"Getting operation mode from heater '{heater}'")
+    r = requests.get(f"http://{heater}/operation-mode", timeout=5)
+    if r.status_code != 200:
+        return None
+    return r.json()
+
+def check_heater_mode():
+    controlIndividually = True
+    for heater in heatersips:
+        s_operation_mode = get_operation_mode(heater)
+        if s_operation_mode is None:
+            print(f"Failed to get operation mode from heater {heater}")
+            continue
+        operation_mode = s_operation_mode["mode"]
+        if operation_mode != "Control individually":
+            print(f"Heater {heater} is not in 'Control individually' mode")
+            print("This script requires all heaters to be in 'Control individually' mode to function properly")
+            print("Do you want to change the operation mode of all heaters to 'Control individually'? (y/n)")
+            answer = input()
+            if answer == "y":
+                r = requests.post(f"http://{heater}/operation-mode", json={"mode": "Control individually"}, timeout=5)
+                if r.status_code != 200:
+                    print(f"Failed to set operation mode of heater {heater}")
+                    controlIndividually = False
+            break
+
+    if not controlIndividually:
+        print("This script requires all heaters to be in 'Control individually' mode")
+        print("This is to ensure that the script can control the heaters individually")
+        time.sleep(5)
+        exit()
+
+def get_temperature_lat_long(lat, lon):
+    if datetime.datetime.now().hour == LAST_HOUR and LAST_TEMP != 0:
+        return LAST_TEMP
+    headers = {
+        'User-Agent': 'weatherCheck/1.0 (+https://darahz.com)'
+    }
+    url = f"https://api.met.no/weatherapi/locationforecast/2.0/mini.json?lat={lat}&lon={lon}"
+    response = requests.get(url, headers=headers)
+    data = response.json()
+    return data["properties"]["timeseries"][0]["data"]["instant"]["details"]["air_temperature"]
+
+def analyze_temperature_trend_detail(heater_data, heater, recent_count=5):
+    """
+    Analyze the temperature trend for a specific heater, showing the sequence of changes.
+    
+    Args:
+        heater_data (dict): The dictionary containing temperature data for heaters.
+        heater (str): The heater identifier to analyze.
+        recent_count (int): The number of recent data points to consider.
+
+    Returns:
+        str: A detailed description of the trend sequence (e.g., "down, up, down"),
+             or "no data" if the heater has no recorded data.
+    """
+
+    if heater not in heater_data or not heater_data[heater]:
+        return "no data"
+
+    temperatures = [entry["room_temp"] for entry in heater_data[heater][-recent_count:]]
+
+    if len(temperatures) < 2:
+        return "no data"
+
+    deltas = [temperatures[i] - temperatures[i - 1] for i in range(1, len(temperatures))]
+
+    trend_sequence = []
+    for delta in deltas:
+        if delta > 0:
+            trend_sequence.append("up")
+        elif delta < 0:
+            trend_sequence.append("down")
+        else:
+            trend_sequence.append("no change")
+
+    return ", ".join(trend_sequence)
+
+#TODO: Will fix this later
+#check_heater_mode()
+
+if os.path.exists("heater_data.csv"):
+    print("Removing previous data file for data logging")
+    os.remove("heater_data.csv")
+
 print("\033[H\033[J", end="")
 while True:
     EL_PRICE = get_current_price()
-    print("\033[H\033[K", end="")
-    print(f"Heater status. Time : {time.ctime()}\033[K")
+    weather  = get_temperature_lat_long(WEATHER_LAT, WEATHER_LON)
+
+    print("\033[H\033[J", end="")
+    print(f"Time : {time.ctime()} Outdoor temperature {weather} \033[K")
     print(f"Current electricity price: {EL_PRICE:.2f} NOK/kWh\033[K")
     print("------------------------------------\033[K")
-
     current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-    log_lines = []
-    total_pr_heater = 0
+
     for index, heater in enumerate(heatersips):
-        attempts = 0
-        response_data = None
-        status_data = None
+        if heater not in heater_data:
+            heater_data[heater] = []
 
-        while attempts < MAX_RETRIES:
-            try:
-                response = requests.get(f"http://{heater}/control-status", timeout=5)
-                status_response = requests.get(f"http://{heater}/status", timeout=5)
-                
-                if response.status_code == 200 and status_response.status_code == 200:
-                    response_data = response.json()
-                    status_data = status_response.json()
-                    break
-                else:
-                    print(f"Error: {response.status_code} from {heater}. Retrying...\033[K")
-            except requests.exceptions.RequestException as e:
-                print(f"Request error from {heater}: {e}\033[K")
-            
-            attempts += 1
-            time.sleep(RETRY_DELAY)
+        r_controlStatus = requests.get(f"http://{heater}/control-status", timeout=5)
+        r_status        = requests.get(f"http://{heater}/status", timeout=5)
+        r_caliboffset   = requests.get(f"http://{heater}/temperature-calibration-offset", timeout=5)
 
-        if response_data is None or status_data is None:
-            print(f"Could not retrieve data from {heater} after {MAX_RETRIES} attempts. Skipping...\033[K")
+        if r_controlStatus.status_code != 200 or r_status.status_code != 200 or r_caliboffset.status_code != 200:
+            print(f"Failed to get status from heater {heater}\033[K")
             continue
+        r_controlStatus = r_controlStatus.json()
+        r_status        = r_status.json()
+        r_caliboffset   = r_caliboffset.json()
 
-        ambient_temperature = response_data['ambient_temperature']
-        set_temperature     = response_data['set_temperature']
-        control_signal      = response_data['control_signal']
-        current_power       = response_data['current_power']
-        old_temp = previousTemps[index]
-        temp_diff = ambient_temperature - old_temp
-
-        if ambient_temperature < old_temp:
-            print(f"Temperature is decreasing in {heater}\033[K")
-            print(f"From \033[94m{old_temp}\033[0m to \033[94m{ambient_temperature}\033[0m\033[K")
-        elif ambient_temperature > old_temp:
-            print(f"Temperature is increasing in {heater}\033[K")
-            print(f"From \033[91m{old_temp}\033[0m to \033[91m{ambient_temperature}\033[0m\033[K")
-        else:
-            print(f"Temperature is stable in {heater}: \033[92m{ambient_temperature}\033[0m\033[K")
-
-        previousTemps[index] = ambient_temperature
-
-        alert_message = ""
-        if ambient_temperature < LOW_TEMP_THRESHOLD:
-            alert_message = f"ALERT: Temperature below {LOW_TEMP_THRESHOLD}°C!"
-        elif ambient_temperature > HIGH_TEMP_THRESHOLD:
-            alert_message = f"ALERT: Temperature above {HIGH_TEMP_THRESHOLD}°C!"
-
-        interval_energy_kWh = current_power / (60.0 * 1000.0)
-        cumulative_energy[index] += interval_energy_kWh
-
-        print(f"Heater name         : {status_data['name']}\033[K")
-        print(f"ambient_temperature : {ambient_temperature} °C\033[K")
-        print(f"set_temperature     : {set_temperature} °C\033[K")
-        print(f"control_signal      : {control_signal}\033[K")
-        print(f"current_power       : {current_power} W\033[K")
-        print(f"Cumulative energy   : {cumulative_energy[index]:.6f} kWh\033[K")
-        print(f"Current cost pr hour: {current_power/1000*EL_PRICE:.2f} NOK\033[K")
-        if alert_message:
-            print(f"\033[93m{alert_message}\033[0m\033[K")
+        f_amb_temp  = r_controlStatus["ambient_temperature"]
+        f_set_temp  = r_controlStatus['set_temperature']
+        f_cur_watt  = r_controlStatus['current_power']
+        print(f"Room temperature: {f_amb_temp:.2f}°C\033[K")
+        print(f"Set temperature : {f_set_temp:.2f}°C\033[K")
+        if f_cur_watt > 0:
+            cumulative_energy[index] += f_cur_watt * SLEEP_TIME / 3600
+            print(f"Cumulative energy usage: {cumulative_energy[index]:.2f} kWh\033[K")
+            print(f"Energy cost pr hour: {(cumulative_energy[index]/1000) * EL_PRICE:.2f} NOK")
+            print(f"Energy cost pr day: {(cumulative_energy[index]/1000) * EL_PRICE * 24:.2f} NOK")
+        print(f"Power usage {f_cur_watt} W\033[K")
+        if r_caliboffset['value'] > 0:
+            print(f"Calibration offset : +{r_caliboffset['value']:.2f}°C\033[K")
+        
+        trend = analyze_temperature_trend_detail(heater_data, heater)
+        amt_trend = trend.split(",")
+        if trend != "no data" and len(amt_trend) > 3:
+            with open("heater_data.csv", "a") as f:
+                f.write(f"{current_time},{f_amb_temp},{f_set_temp},{r_caliboffset['value']},{EL_PRICE},{f_cur_watt},{trend}\n")
+        print(f"Temperature trend: {trend}\033[K")
         print("------------------------------------\033[K")
-        total_pr_heater += current_power/1000*EL_PRICE
-        log_lines.append(
-            f"{current_time},{heater},{status_data['name']},{ambient_temperature},{temp_diff},{alert_message},{cumulative_energy[index]:.6f}\n"
-        )
 
-    with open("previous_state.json", "w") as f:
-        json.dump({"previousTemps": previousTemps, "cumulative_energy": cumulative_energy}, f)
-
-    with open("heaters_log.csv", "a") as log_file:
-        for line in log_lines:
-            log_file.write(line)
-
-    now = datetime.datetime.now()
-    days_in_month = calendar.monthrange(now.year, now.month)[1]
-    
-    print(f"Total cost pr day: {(total_pr_heater * 24):.2f} NOK\033[K")
-    print(f"Total cost pr month: {((total_pr_heater * 24) * days_in_month):.2f} NOK\033[K")
-    print("\033[H", end="")
-    time.sleep(LOG_INTERVAL)
+        heater_data[heater].append({
+            "time": current_time,
+            "room_temp": f_amb_temp,
+            "set_temp": f_set_temp,
+            "calib_offset": r_caliboffset['value'],
+            "price": EL_PRICE
+        })
+    time.sleep(SLEEP_TIME)
